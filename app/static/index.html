@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>DataMedic — Self-Healing Data Analyst</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link
+  href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500&family=IBM+Plex+Sans+Condensed:wght@600;700&display=swap"
+  rel="stylesheet"
+/>
+<link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+<div class="scanlines" aria-hidden="true"></div>
+
+<header>
+  <div class="masthead">
+    <span class="pulse-dot" id="pulse-dot" aria-hidden="true"></span>
+    <h1>DataMedic<span class="cursor" aria-hidden="true">_</span></h1>
+  </div>
+  <p class="tagline">Upload a CSV, ask a question in plain English. Watch the agent write code, fail, read its own traceback, and heal itself.</p>
+  <canvas id="pulse-line" height="46" aria-hidden="true"></canvas>
+</header>
+
+<main>
+  <section id="upload-panel" class="panel">
+    <p class="eyebrow">01 · Input</p>
+    <form id="analyze-form">
+      <div id="dropzone" class="dropzone" tabindex="0" role="button" aria-label="Choose a CSV file">
+        <input type="file" id="file-input" accept=".csv" hidden />
+        <svg class="drop-icon" width="28" height="28" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <path d="M12 3v12m0 0-4-4m4 4 4-4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+          <path d="M4 16v2.5A2.5 2.5 0 0 0 6.5 21h11a2.5 2.5 0 0 0 2.5-2.5V16" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+        </svg>
+        <p id="dropzone-text">Drop a CSV, or click to browse</p>
+        <p id="file-name" class="file-name"></p>
+      </div>
+
+      <label for="question" class="field-label">Question</label>
+      <textarea id="question" rows="2" placeholder="e.g. What's the monthly revenue trend?"></textarea>
+
+      <button type="submit" id="submit-btn">
+        <span class="btn-label">Run analysis</span>
+      </button>
+    </form>
+  </section>
+
+  <section id="status-panel" class="panel hidden">
+    <p class="eyebrow">02 · Vitals</p>
+    <div class="status-row">
+      <span id="status-pill" class="pill"></span>
+      <div class="attempt-meter" id="attempt-meter" aria-hidden="true"></div>
+      <span id="attempt-label" class="attempt-label"></span>
+    </div>
+    <div id="attempts"></div>
+  </section>
+
+  <section id="result-panel" class="panel hidden">
+    <p class="eyebrow">03 · Diagnosis</p>
+    <img id="chart-img" class="chart" alt="Generated chart" />
+    <p id="summary" class="summary"></p>
+
+    <details id="code-details">
+      <summary>
+        <span>Final code</span>
+        <button type="button" id="copy-btn">Copy</button>
+      </summary>
+      <pre><code id="final-code"></code></pre>
+    </details>
+  </section>
+</main>
+
+<footer>
+  <p>local subprocess sandbox · llama-3.3-70b-versatile via Groq · no data leaves this machine</p>
+</footer>
+
+<script src="/app.js"></script>
+</body>
+</html>
