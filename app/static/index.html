@@ -39,7 +39,8 @@
       </div>
 
       <label for="question" class="field-label">Question</label>
-      <textarea id="question" rows="2" placeholder="e.g. What's the monthly revenue trend?"></textarea>
+      <textarea id="question" rows="2" placeholder="e.g. What's the monthly revenue trend? — or leave empty to auto-explore"></textarea>
+      <div id="suggestions" class="suggestions" aria-live="polite"></div>
 
       <button type="submit" id="submit-btn">
         <span class="btn-label">Run analysis</span>
@@ -59,8 +60,10 @@
 
   <section id="result-panel" class="panel hidden">
     <p class="eyebrow">03 · Diagnosis</p>
-    <img id="chart-img" class="chart" alt="Generated chart" />
+    <div id="metrics" class="metrics"></div>
+    <div id="charts" class="charts"></div>
     <p id="summary" class="summary"></p>
+    <p id="verified-badge" class="verified-badge hidden">✓ numbers fact-checked against the script's output</p>
 
     <details id="code-details">
       <summary>

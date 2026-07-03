@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import tempfile
@@ -20,7 +21,8 @@ if TYPE_CHECKING:
 
 MODEL_NAME = "llama-3.3-70b-versatile"
 PROFILE_MAX_CHARS = 1500
-CHART_FILENAME = "chart.png"
+MAX_QUALITY_REVIEWS = 1  # how many "ran fine but analytically weak" redos are allowed
+EDA_QUESTION = "(auto-explore) What are the most interesting insights in this dataset?"
 
 _llm: ChatGroq | None = None
 
@@ -52,9 +54,39 @@ def _strip_code_fence(text: str) -> str:
     return match.group(1).strip() if match else text.strip()
 
 
-def profile_csv(state: AgentState) -> AgentState:
-    """Deterministic: load the CSV and summarize its shape/dtypes/nulls/sample rows."""
-    df = pd.read_csv(state["csv_path"])
+def _parse_json_reply(text: str) -> dict:
+    """Parse a JSON object out of an LLM reply, tolerating code fences and stray prose."""
+    text = text.strip()
+    fence = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL)
+    if fence:
+        text = fence.group(1).strip()
+    start, end = text.find("{"), text.rfind("}")
+    if start == -1 or end <= start:
+        raise ValueError(f"no JSON object in reply: {text[:200]!r}")
+    return json.loads(text[start : end + 1])
+
+
+_METRICS_LINE_RE = re.compile(r"^METRICS_JSON:\s*(\{.*\})\s*$", re.MULTILINE)
+
+
+def extract_metrics(stdout: str) -> list[dict]:
+    """Pull the structured METRICS_JSON line out of script stdout; [] if absent/broken."""
+    match = _METRICS_LINE_RE.search(stdout)
+    if not match:
+        return []
+    try:
+        payload = json.loads(match.group(1))
+    except json.JSONDecodeError:
+        return []
+    metrics = payload.get("metrics", [])
+    if not isinstance(metrics, list):
+        return []
+    return [m for m in metrics if isinstance(m, dict) and m.get("label") and m.get("value")]
+
+
+def profile_csv_text(csv_path: str) -> str:
+    """Load a CSV and produce the profile string used in every prompt."""
+    df = pd.read_csv(csv_path)
     lines = [
         f"shape: {df.shape[0]} rows x {df.shape[1]} columns",
         "",
@@ -70,29 +102,56 @@ def profile_csv(state: AgentState) -> AgentState:
     profile = "\n".join(lines)
     if len(profile) > PROFILE_MAX_CHARS:
         profile = profile[:PROFILE_MAX_CHARS] + "\n...[truncated]"
+    return profile
 
-    state["csv_profile"] = profile
+
+def suggest_questions(csv_path: str) -> list[str]:
+    """One-shot: propose 3 questions this CSV can answer. Used by the /suggest endpoint."""
+    profile = profile_csv_text(csv_path)
+    reply = _ask(
+        prompts.SUGGEST_SYSTEM_PROMPT,
+        prompts.SUGGEST_USER_TEMPLATE.format(csv_profile=profile),
+    )
+    questions = _parse_json_reply(reply).get("questions", [])
+    return [q for q in questions if isinstance(q, str) and q.strip()][:3]
+
+
+def profile_csv(state: AgentState) -> AgentState:
+    """Deterministic: load the CSV and summarize its shape/dtypes/nulls/sample rows."""
+    state["csv_profile"] = profile_csv_text(state["csv_path"])
     state["status"] = "planning"
     return state
 
 
 def plan(state: AgentState) -> AgentState:
-    """LLM: turn the profile + question into a short analysis plan."""
-    user_prompt = prompts.PLAN_USER_TEMPLATE.format(
-        csv_profile=state["csv_profile"], question=state["question"]
-    )
-    state["plan"] = _ask(prompts.PLAN_SYSTEM_PROMPT, user_prompt)
+    """LLM: turn the profile + question into a short analysis plan.
+
+    An empty question switches to auto-EDA mode: the model picks the most
+    interesting analyses itself.
+    """
+    if state["question"].strip():
+        state["mode"] = "question"
+        user_prompt = prompts.PLAN_USER_TEMPLATE.format(
+            csv_profile=state["csv_profile"], question=state["question"]
+        )
+        state["plan"] = _ask(prompts.PLAN_SYSTEM_PROMPT, user_prompt)
+    else:
+        state["mode"] = "eda"
+        state["question"] = EDA_QUESTION
+        user_prompt = prompts.PLAN_EDA_USER_TEMPLATE.format(csv_profile=state["csv_profile"])
+        state["plan"] = _ask(prompts.PLAN_EDA_SYSTEM_PROMPT, user_prompt)
+
     state["status"] = "coding"
     return state
 
 
 def write_code(state: AgentState) -> AgentState:
-    """LLM: write (or rewrite, given prior failure) a standalone analysis script."""
+    """LLM: write (or rewrite, given prior failure/review) a standalone analysis script."""
     state["attempt"] = state.get("attempt", 0) + 1
 
-    system_prompt = prompts.WRITE_CODE_SYSTEM_PROMPT.format(
-        csv_path=state["csv_path"], chart_path=CHART_FILENAME
-    )
+    # The runner copies the CSV into the sandbox cwd as data.csv (see execute), so the
+    # model never has to transcribe a long temp path — a reliable source of typo bugs.
+    system_prompt = prompts.WRITE_CODE_SYSTEM_PROMPT.format(csv_path="data.csv")
 
     history = state.get("history", [])
     if history:
@@ -121,28 +180,72 @@ def execute(state: AgentState) -> AgentState:
     """Deterministic: run the generated code in a fresh temp dir and capture the result."""
     with tempfile.TemporaryDirectory() as tmpdir:
         tempdir = Path(tmpdir)
-        chart_path = tempdir / CHART_FILENAME
-
-        result = execute_code(state["code"], tempdir, chart_path)
+        # place the data where the generated code expects it: ./data.csv in the sandbox
+        (tempdir / "data.csv").write_bytes(Path(state["csv_path"]).read_bytes())
+        result = execute_code(state["code"], tempdir, tempdir / "chart_1.png")
 
         state["stdout"] = result.stdout
         state["stderr"] = result.stderr
 
         if result.success:
-            # Not "done" yet — summarize still has to run. Flipping to "done" here
-            # would let a polling client stop early and read result_summary empty.
-            state["status"] = "summarizing"
-            if result.chart_created:
-                # Persist next to the job's own CSV, since the subprocess temp dir is
-                # deleted as soon as this block exits.
-                persist_path = Path(state["csv_path"]).parent / CHART_FILENAME
-                persist_path.write_bytes(chart_path.read_bytes())
-                state["chart_path"] = str(persist_path)
-            else:
-                state["chart_path"] = None
+            state["metrics"] = extract_metrics(result.stdout)
+            # Persist charts next to the job's own CSV, since the subprocess temp dir
+            # is deleted as soon as this block exits.
+            job_dir = Path(state["csv_path"]).parent
+            charts: list[str] = []
+            for src in sorted(tempdir.glob("chart_*.png")):
+                dest = job_dir / src.name
+                dest.write_bytes(src.read_bytes())
+                charts.append(str(dest))
+            state["charts"] = charts
+            state["chart_path"] = charts[0] if charts else None
+            # Not "done" yet — review, summarize, and verify still have to run.
+            state["status"] = "reviewing"
         else:
-            state["status"] = "fixing"
+            state["charts"] = []
             state["chart_path"] = None
+            state["status"] = "fixing"
+
+    return state
+
+
+def review(state: AgentState) -> AgentState:
+    """LLM quality critic: the script ran, but does its output actually answer the question?
+
+    Analytically weak output is sent back to write_code (within a small budget) with
+    the reviewer's feedback taking the place of a crash critique.
+    """
+    user_prompt = prompts.REVIEW_USER_TEMPLATE.format(
+        question=state["question"],
+        plan=state["plan"],
+        stdout=state["stdout"],
+        n_charts=len(state.get("charts", [])),
+    )
+    try:
+        verdict = _parse_json_reply(_ask(prompts.REVIEW_SYSTEM_PROMPT, user_prompt))
+    except (ValueError, json.JSONDecodeError):
+        verdict = {"verdict": "approve", "feedback": ""}  # unparseable review never blocks
+
+    wants_revision = verdict.get("verdict") == "revise" and bool(verdict.get("feedback"))
+    budget_left = (
+        state.get("reviews_used", 0) < MAX_QUALITY_REVIEWS
+        and state["attempt"] < state["max_attempts"]
+    )
+
+    if wants_revision and budget_left:
+        state["reviews_used"] = state.get("reviews_used", 0) + 1
+        history = state.get("history", [])
+        history.append(
+            {
+                "code": state["code"],
+                "stderr": "[quality review] the script ran, but the reviewer rejected the analysis",
+                "critique": verdict["feedback"],
+            }
+        )
+        state["history"] = history
+        state["status"] = "fixing"
+    else:
+        state["status"] = "summarizing"
 
     return state
 
@@ -166,5 +269,22 @@ def summarize(state: AgentState) -> AgentState:
         question=state["question"], plan=state["plan"], stdout=state["stdout"]
     )
     state["result_summary"] = _ask(prompts.SUMMARIZE_SYSTEM_PROMPT, user_prompt)
+    state["status"] = "verifying"
+    return state
+
+
+def verify(state: AgentState) -> AgentState:
+    """LLM fact-checker: every number in the summary must be grounded in the stdout."""
+    user_prompt = prompts.VERIFY_USER_TEMPLATE.format(
+        summary=state["result_summary"], stdout=state["stdout"]
+    )
+    try:
+        verdict = _parse_json_reply(_ask(prompts.VERIFY_SYSTEM_PROMPT, user_prompt))
+        if not verdict.get("accurate", True) and verdict.get("corrected_summary"):
+            state["result_summary"] = verdict["corrected_summary"]
+        state["verified"] = True
+    except (ValueError, json.JSONDecodeError):
+        state["verified"] = False  # verification failed to run; don't claim the badge
+
     state["status"] = "done"
     return state

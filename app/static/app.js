@@ -15,9 +15,12 @@
   const attemptLabel = document.getElementById("attempt-label");
   const attemptsEl = document.getElementById("attempts");
 
+  const suggestionsEl = document.getElementById("suggestions");
   const resultPanel = document.getElementById("result-panel");
-  const chartImg = document.getElementById("chart-img");
+  const metricsEl = document.getElementById("metrics");
+  const chartsEl = document.getElementById("charts");
   const summaryEl = document.getElementById("summary");
+  const verifiedBadge = document.getElementById("verified-badge");
   const finalCodeEl = document.getElementById("final-code");
   const copyBtn = document.getElementById("copy-btn");
 
@@ -66,6 +69,34 @@
     fileNameEl.style.color = "var(--success)";
     fileNameEl.textContent = `${file.name} · ${(file.size / 1024).toFixed(1)} KB`;
     dropzoneText.textContent = "Drop a different CSV, or click to browse";
+    fetchSuggestions(file);
+  }
+
+  // ---------- suggested questions ----------
+
+  async function fetchSuggestions(file) {
+    suggestionsEl.innerHTML = `<span class="suggestions-hint">Reading your data for question ideas…</span>`;
+    const body = new FormData();
+    body.append("file", file);
+    try {
+      const res = await fetch("/suggest", { method: "POST", body });
+      const { questions } = await res.json();
+      if (file !== selectedFile) return; // a newer file was chosen meanwhile
+      suggestionsEl.innerHTML = "";
+      for (const q of questions) {
+        const chip = document.createElement("button");
+        chip.type = "button";
+        chip.className = "chip";
+        chip.textContent = q;
+        chip.addEventListener("click", () => {
+          questionEl.value = q;
+          questionEl.focus();
+        });
+        suggestionsEl.appendChild(chip);
+      }
+    } catch {
+      suggestionsEl.innerHTML = "";
+    }
   }
 
   // ---------- submit ----------
@@ -77,11 +108,7 @@
       fileNameEl.textContent = "Choose a CSV first";
       return;
     }
-    const question = questionEl.value.trim();
-    if (!question) {
-      questionEl.focus();
-      return;
-    }
+    const question = questionEl.value.trim(); // empty = auto-EDA mode
 
     setBusy(true);
     resetPanels();
@@ -159,7 +186,9 @@
     planning: "Planning",
     coding: "Writing code",
     executing: "Executing",
+    reviewing: "Reviewing quality",
     summarizing: "Writing summary",
+    verifying: "Fact-checking",
     fixing: "Fixing",
     done: "Done",
     failed: "Failed",
@@ -187,10 +216,11 @@
   function renderAttempts(history) {
     for (let i = renderedAttempts; i < history.length; i++) {
       const h = history[i];
+      const isReview = (h.stderr || "").startsWith("[quality review]");
       const card = document.createElement("div");
-      card.className = "attempt-card";
+      card.className = "attempt-card" + (isReview ? " review-card" : "");
       card.innerHTML = `
-        <h3>Attempt ${i + 1} failed</h3>
+        <h3>${isReview ? `Attempt ${i + 1} sent back by reviewer` : `Attempt ${i + 1} failed`}</h3>
         <details>
           <summary>Show code</summary>
           <pre><code>${escapeHtml(h.code)}</code></pre>
@@ -205,13 +235,32 @@
 
   function renderResult(result) {
     resultPanel.classList.remove("hidden");
-    if (result.chart_url) {
-      chartImg.src = result.chart_url + `?t=${Date.now()}`;
-      chartImg.style.display = "block";
-    } else {
-      chartImg.style.display = "none";
+
+    metricsEl.innerHTML = "";
+    for (const m of result.metrics || []) {
+      const card = document.createElement("div");
+      card.className = "metric-card";
+      card.innerHTML = `
+        <span class="metric-value">${escapeHtml(m.value)}</span>
+        <span class="metric-label">${escapeHtml(m.label)}</span>
+        ${m.detail ? `<span class="metric-detail">${escapeHtml(m.detail)}</span>` : ""}
+      `;
+      metricsEl.appendChild(card);
     }
+
+    chartsEl.innerHTML = "";
+    const urls = result.chart_urls || [];
+    chartsEl.classList.toggle("two-col", urls.length > 1);
+    for (const url of urls) {
+      const img = document.createElement("img");
+      img.className = "chart";
+      img.alt = "Generated chart";
+      img.src = url + `?t=${Date.now()}`;
+      chartsEl.appendChild(img);
+    }
+
     summaryEl.textContent = result.result_summary;
+    verifiedBadge.classList.toggle("hidden", !result.verified);
     finalCodeEl.textContent = result.code;
   }
 
