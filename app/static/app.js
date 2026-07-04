@@ -198,6 +198,10 @@
   };
 
   const STREAMING_NODES = new Set(["plan", "write_code", "critique", "summarize"]);
+  const SILENT_PLACEHOLDERS = {
+    execute: "…running the script (no LLM call — deterministic)",
+    race: "…rival coders writing in parallel, see lanes above",
+  };
   const MAX_STREAM_CHARS = 8000;
 
   function setActiveNode(node) {
@@ -227,7 +231,11 @@
       case "node_start": {
         setActiveNode(ev.node);
         streamNodeEl.textContent = NODE_LABELS[ev.node] || ev.node;
-        if (STREAMING_NODES.has(ev.node)) streamTextEl.textContent = "";
+        // Always clear — otherwise a non-streaming node (review/verify/learn)
+        // would keep showing leftover text from the last streaming node.
+        streamTextEl.textContent = STREAMING_NODES.has(ev.node)
+          ? ""
+          : SILENT_PLACEHOLDERS[ev.node] || "…thinking";
         break;
       }
       case "node_end": {

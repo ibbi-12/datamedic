@@ -321,6 +321,42 @@ def test_learned_lessons_are_injected_into_coder_prompt(csv_file, scripted_llm, 
     assert "Cast revenue-like columns to numeric" in coder_prompt
 
 
+def test_retry_prompt_carries_all_prior_failures(csv_file, monkeypatch):
+    """By attempt 3 the coder must see BOTH earlier failures, not just the last one,
+    so it stops cycling between two wrong fixes."""
+    seen_prompts: list[str] = []
+    replies = [
+        "Plan.",
+        f"```python\nraise KeyError('first-bug')\n```",   # attempt 1
+        "First diagnosis.",                                # critique 1
+        f"```python\nraise ValueError('second-bug')\n```", # attempt 2
+        "Second diagnosis.",                               # critique 2
+        f"```python\n{GOOD_CODE}\n```",                    # attempt 3
+        APPROVE,
+        "Summary.",
+        ACCURATE,
+        NO_LESSONS,
+    ]
+
+    def fake_ask(system_prompt: str, user_prompt: str, node: str | None = None) -> str:
+        seen_prompts.append(user_prompt)
+        return replies.pop(0)
+
+    monkeypatch.setattr(nodes, "_ask", fake_ask)
+
+    final = build_graph().invoke(make_state(csv_file))
+
+    assert final["status"] == "done"
+    third_coder_prompt = seen_prompts[5]
+    assert "Earlier failed attempts" in third_coder_prompt
+    assert "first-bug" in third_coder_prompt          # attempt 1's error is still visible
+    assert "First diagnosis." in third_coder_prompt   # and the advice that failed
+    assert "second-bug" in third_coder_prompt         # latest failure present in detail
+    # attempt 2's prompt has only one prior failure -> no earlier-failures block
+    second_coder_prompt = seen_prompts[3]
+    assert "Earlier failed attempts" not in second_coder_prompt
+
+
 # --- unit tests for memory ---
 
 
@@ -389,3 +425,66 @@ def test_parse_json_reply_tolerates_fences_and_prose():
 def test_strip_code_fence_variants():
     assert _strip_code_fence("```python\nx = 1\n```") == "x = 1"
     assert _strip_code_fence("x = 1") == "x = 1"
+
+
+# --- unit tests for daily-quota fast-fail ---
+
+
+def _fake_rate_limit_error(message: str):
+    import groq
+    import httpx
+
+    req = httpx.Request("POST", "https://api.groq.com/x")
+    resp = httpx.Response(429, request=req)
+    return groq.RateLimitError(message, response=resp, body=None)
+
+
+def test_daily_quota_error_is_detected():
+    daily = _fake_rate_limit_error(
+        "Error code: 429 - rate limit reached ... on tokens per day (TPD): Limit 100000"
+    )
+    per_minute = _fake_rate_limit_error("Error code: 429 - rate limit reached ... per minute")
+    assert nodes._is_daily_quota_error(daily) is True
+    assert nodes._is_daily_quota_error(per_minute) is False
+
+
+def test_ask_fails_fast_on_daily_quota_without_retry_sleep(monkeypatch):
+    """A TPD 429 must raise immediately with an actionable message, not burn
+    LLM_ATTEMPTS worth of sleeps retrying a quota that won't clear for minutes."""
+    calls = {"n": 0}
+
+    class FakeLLM:
+        def invoke(self, messages):
+            calls["n"] += 1
+            raise _fake_rate_limit_error(
+                "Error code: 429 - ... on tokens per day (TPD): Limit 100000, Used 99950"
+            )
+
+    monkeypatch.setattr(nodes, "_get_llm", lambda: FakeLLM())
+    slept = []
+    monkeypatch.setattr(nodes.time, "sleep", lambda s: slept.append(s))
+
+    with pytest.raises(nodes.DailyQuotaExceeded) as exc_info:
+        nodes._ask("system", "user")
+
+    assert calls["n"] == 1  # no retries burned on a hard daily cap
+    assert slept == []
+    assert "DATAMEDIC_MODEL" in str(exc_info.value)
+
+
+def test_ask_still_retries_transient_errors(monkeypatch):
+    """A non-quota error (e.g. a transient network blip) should still retry."""
+    calls = {"n": 0}
+
+    class FakeLLM:
+        def invoke(self, messages):
+            calls["n"] += 1
+            if calls["n"] < 2:
+                raise ConnectionError("transient blip")
+            return type("R", (), {"content": "ok"})()
+
+    monkeypatch.setattr(nodes, "_get_llm", lambda: FakeLLM())
+    monkeypatch.setattr(nodes.time, "sleep", lambda s: None)
+
+    assert nodes._ask("system", "user") == "ok"
+    assert calls["n"] == 2

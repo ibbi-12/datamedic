@@ -51,13 +51,23 @@ dpi=110 and bbox_inches="tight"; never call plt.show(). Close each figure after 
 - Make charts presentation-quality: seaborn styling, a descriptive title, labeled axes, \
 and annotate the single most important point on each chart (e.g. peak value, largest gap) \
 with its actual number.
+- Time-series charts safely: convert the period/date grouping to STRING labels before \
+plotting (e.g. .dt.strftime('%Y-%m')), plot against those strings, and pass the same string \
+as the annotation's x-coordinate — never pass a Timestamp or Period to plt.annotate. \
+On pandas 2.2+ use freq='ME' (not 'M') with pd.Grouper/resample.
 - Go beyond a bare groupby when the data supports it: percentage changes, correlations, \
 simple trend direction, or share-of-total make findings more meaningful.
-- As the LAST line of stdout, print exactly one line in this format (compact, single line):
-METRICS_JSON: {{"metrics": [{{"label": "<short name>", "value": "<formatted number>", \
-"detail": "<one-line context>"}}]}}
-  with 3 to 6 of the most important metrics from your findings. Values must come from the \
-computed results, formatted for humans (e.g. "$69,165", "63%", "May 2024").
+- As the LAST line of stdout, print exactly one line starting with "METRICS_JSON: " \
+followed by a compact JSON object of the form {{"metrics": [{{"label": "<short name>", \
+"value": "<formatted number>", "detail": "<one-line context>"}}]}} with 3 to 6 of the most \
+important metrics from your findings. Values must come from the computed results, formatted \
+for humans (e.g. "$69,165", "63%", "May 2024"). Build this line ONLY like this:
+  metrics = [{{"label": ..., "value": ..., "detail": ...}}, ...]
+  print("METRICS_JSON: " + json.dumps({{"metrics": metrics}}))
+  NEVER construct it with an f-string — escaped quotes inside f-strings are a syntax error.
+- Label every statistic honestly: std() is a standard deviation, std()/sqrt(n) is a standard \
+error (not a standard deviation), mean and median are different things. A mislabeled number \
+is worse than no number.
 - Only import from: pandas, numpy, matplotlib (and matplotlib.pyplot), seaborn, json. Do not \
 import os, sys, subprocess, requests, urllib, socket, shutil, and do not use eval(, exec(, or \
 __import__.
@@ -85,7 +95,7 @@ Question: {question}
 
 Analysis plan:
 {plan}
-
+{prior_failures}
 Your previous attempt (attempt {attempt}) failed. Here is what you wrote, what it printed to \
 stderr, and a diagnosis of the bug:
 
@@ -100,8 +110,14 @@ stderr:
 Critique / fix strategy:
 {critique}
 
-Write a corrected, complete Python script now. Fix the specific bug described above — do not \
-repeat it."""
+Write a corrected, complete Python script now. Fix the specific bug described above, and do \
+NOT reintroduce any bug from the earlier attempts listed — if the same error appeared twice, \
+your previous fix strategy was wrong and you must take a structurally different approach."""
+
+PRIOR_FAILURES_TEMPLATE = """
+Earlier failed attempts (do not repeat any of these mistakes):
+{failures}
+"""
 
 
 CRITIQUE_SYSTEM_PROMPT = """You are debugging a failed Python data-analysis script. You will \
@@ -113,6 +129,10 @@ Rules:
 - Be specific: name the exact line, variable, or column causing the failure if identifiable.
 - Describe the fix strategy concretely (e.g. "strip '$' and ',' from the price column and cast \
 to float before summing"), not just "fix the bug".
+- If the error is an f-string SyntaxError (backslashes or nested quotes inside an f-string), \
+the ONLY reliable fix is to stop using an f-string for that line: build the data as a dict/list \
+and serialize with json.dumps(), or use plain string concatenation. Never suggest re-quoting or \
+re-escaping inside the same f-string — that does not work and wastes an attempt.
 """
 
 CRITIQUE_USER_TEMPLATE = """Code that failed:
@@ -150,12 +170,17 @@ Write the plain-English insight now."""
 
 REVIEW_SYSTEM_PROMPT = """You are a demanding analytics lead reviewing a junior analyst's \
 work before it goes to a stakeholder. The script RAN SUCCESSFULLY — you are judging quality, \
-not correctness of execution.
+not correctness of execution. You are given the code as well as its output: read the code.
 
 Approve only if ALL of these hold:
 - The stdout findings actually answer the user's question (not a tangent).
 - The findings contain concrete numbers, not just table dumps.
 - The number of charts produced matches what the plan called for.
+- Every statistical label in the output matches what the code actually computes. Check the \
+formulas: std() is a standard deviation, but std()/sqrt(n) is a STANDARD ERROR and must not \
+be labeled "standard deviation"; mean vs median; count vs sum; a share of one group vs a \
+share of the total. A correctly-computed number under a wrong label is grounds for revision \
+— it will mislead the stakeholder.
 
 Request a revision if the output is technically fine but analytically weak — e.g. it answers \
 a different question, prints raw unaggregated rows, or produced no chart when one was planned.
@@ -172,6 +197,11 @@ REVIEW_USER_TEMPLATE = """User's question: {question}
 
 Analysis plan:
 {plan}
+
+The code that ran:
+```python
+{code}
+```
 
 Script stdout:
 {stdout}

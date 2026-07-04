@@ -12,6 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import groq
 import pandas as pd
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_groq import ChatGroq
@@ -38,13 +39,25 @@ def _get_llm() -> ChatGroq:
             model=MODEL_NAME,
             temperature=0.2,
             api_key=os.environ.get("GROQ_API_KEY"),
-            max_retries=5,
+            # We own retrying in _ask (and want to skip it entirely for a hard
+            # daily quota) — the SDK's own silent retries would just burn time
+            # re-hitting the same 429 before we ever see it.
+            max_retries=0,
         )
     return _llm
 
 
 LLM_ATTEMPTS = 3
-LLM_BACKOFF_SECONDS = 15  # Groq free tier rate-limits by the minute; wait it out
+LLM_BACKOFF_SECONDS = 15  # short transient errors only; see _is_daily_quota_error
+
+
+def _is_daily_quota_error(exc: Exception) -> bool:
+    """True for Groq's 'tokens per day' cap — retrying won't help for minutes."""
+    return isinstance(exc, groq.RateLimitError) and "per day" in str(exc).lower()
+
+
+class DailyQuotaExceeded(RuntimeError):
+    """Raised in place of the raw 429 so callers/UI get an actionable message."""
 
 
 def _ask(system_prompt: str, user_prompt: str, node: str | None = None) -> str:
@@ -74,8 +87,16 @@ def _ask(system_prompt: str, user_prompt: str, node: str | None = None) -> str:
                     return llm.invoke(messages).content.strip()
             emit("token_end", node=node)
             return "".join(parts).strip()
-        except Exception as exc:  # rate limit / transient network — back off and retry
-            last_exc = exc
+        except Exception as exc:  # rate limit / transient network
+            if _is_daily_quota_error(exc):
+                raise DailyQuotaExceeded(
+                    f"Daily token quota reached for model '{MODEL_NAME}'. "
+                    "Retrying won't help for several minutes. Set DATAMEDIC_MODEL to a "
+                    "different model (e.g. llama-3.1-8b-instant, a separate quota "
+                    "bucket) or wait for the daily reset. Groq said: "
+                    f"{exc}"
+                ) from exc
+            last_exc = exc  # transient — worth a short backoff and retry
     raise last_exc  # type: ignore[misc]
 
 
@@ -255,10 +276,21 @@ def write_code(state: AgentState) -> AgentState:
     if history:
         system_prompt = prompts.WRITE_CODE_SYSTEM_PROMPT.format(csv_path="data.csv")
         last = history[-1]
+        earlier = history[:-1]
+        if earlier:
+            failures = "\n".join(
+                f"- attempt {i + 1}: {h['stderr'].strip().splitlines()[-1][:160]}"
+                f" (advice given: {h['critique'][:160]})"
+                for i, h in enumerate(earlier)
+            )
+            prior_failures = prompts.PRIOR_FAILURES_TEMPLATE.format(failures=failures)
+        else:
+            prior_failures = ""
         user_prompt = prompts.WRITE_CODE_RETRY_TEMPLATE.format(
             csv_profile=state["csv_profile"],
             question=state["question"],
             plan=state["plan"],
+            prior_failures=prior_failures,
             attempt=state["attempt"] - 1,
             previous_code=last["code"],
             stderr=last["stderr"],
@@ -358,6 +390,7 @@ def review(state: AgentState) -> AgentState:
     user_prompt = prompts.REVIEW_USER_TEMPLATE.format(
         question=state["question"],
         plan=state["plan"],
+        code=state["code"],
         stdout=state["stdout"],
         n_charts=len(state.get("charts", [])),
     )
