@@ -20,7 +20,7 @@
     <span class="pulse-dot" id="pulse-dot" aria-hidden="true"></span>
     <h1>DataMedic<span class="cursor" aria-hidden="true">_</span></h1>
   </div>
-  <p class="tagline">Upload a CSV, ask a question in plain English. Watch the agent write code, fail, read its own traceback, and heal itself.</p>
+  <p class="tagline">Upload a CSV, ask a question in plain English. Watch the agent write code, fail, read its own traceback, and heal itself — live.</p>
   <canvas id="pulse-line" height="46" aria-hidden="true"></canvas>
 </header>
 
@@ -42,14 +42,58 @@
       <textarea id="question" rows="2" placeholder="e.g. What's the monthly revenue trend? — or leave empty to auto-explore"></textarea>
       <div id="suggestions" class="suggestions" aria-live="polite"></div>
 
+      <label class="race-toggle">
+        <input type="checkbox" id="race-checkbox" />
+        <span>⚡ Race mode — two rival coders compete, a judge picks the winner</span>
+      </label>
+
       <button type="submit" id="submit-btn">
         <span class="btn-label">Run analysis</span>
       </button>
     </form>
   </section>
 
+  <section id="cockpit-panel" class="panel hidden">
+    <p class="eyebrow">02 · Agent cockpit</p>
+
+    <svg id="agent-graph" viewBox="0 0 740 178" role="img" aria-label="Live agent state machine">
+      <!-- edges -->
+      <path id="e-profile-plan"   class="edge" d="M88 47 H100" />
+      <path id="e-plan-code"      class="edge" d="M178 47 H190" />
+      <path id="e-code-run"       class="edge" d="M268 47 H280" />
+      <path id="e-run-review"     class="edge" d="M358 47 H370" />
+      <path id="e-review-summary" class="edge" d="M448 47 H460" />
+      <path id="e-summary-verify" class="edge" d="M538 47 H550" />
+      <path id="e-verify-learn"   class="edge" d="M628 47 H640" />
+      <path id="e-run-critique"   class="edge edge-fail" d="M319 64 V102" />
+      <path id="e-critique-code"  class="edge edge-fail" d="M275 119 H229 V64" />
+      <path id="e-review-code"    class="edge edge-fail" d="M409 64 V150 H229 V64" />
+      <!-- nodes: x,y,width fixed; JS toggles classes -->
+      <g id="n-profile_csv" class="gnode"><rect x="10"  y="30" width="78" height="34" rx="7"/><text x="49"  y="51">profile</text></g>
+      <g id="n-plan"        class="gnode"><rect x="100" y="30" width="78" height="34" rx="7"/><text x="139" y="51">plan</text></g>
+      <g id="n-code"        class="gnode"><rect x="190" y="30" width="78" height="34" rx="7"/><text x="229" y="51">code</text></g>
+      <g id="n-execute"     class="gnode"><rect x="280" y="30" width="78" height="34" rx="7"/><text x="319" y="51">run</text></g>
+      <g id="n-review"      class="gnode"><rect x="370" y="30" width="78" height="34" rx="7"/><text x="409" y="51">review</text></g>
+      <g id="n-summarize"   class="gnode"><rect x="460" y="30" width="78" height="34" rx="7"/><text x="499" y="51">summary</text></g>
+      <g id="n-verify"      class="gnode"><rect x="550" y="30" width="78" height="34" rx="7"/><text x="589" y="51">verify</text></g>
+      <g id="n-learn"       class="gnode"><rect x="640" y="30" width="78" height="34" rx="7"/><text x="679" y="51">learn</text></g>
+      <g id="n-critique"    class="gnode gnode-fail"><rect x="280" y="102" width="78" height="34" rx="7"/><text x="319" y="123">critique</text></g>
+      <text class="graph-caption" x="10" y="168">the live state machine — amber node is thinking, red loop is the self-heal path</text>
+    </svg>
+
+    <div id="race-lanes" class="race-lanes hidden"></div>
+
+    <div id="stream-box" class="stream-box">
+      <div class="stream-head">
+        <span id="stream-node" class="stream-node">waiting…</span>
+        <span id="lessons-chip" class="lessons-chip hidden"></span>
+      </div>
+      <pre id="stream-text" class="stream-text"></pre>
+    </div>
+  </section>
+
   <section id="status-panel" class="panel hidden">
-    <p class="eyebrow">02 · Vitals</p>
+    <p class="eyebrow">03 · Vitals</p>
     <div class="status-row">
       <span id="status-pill" class="pill"></span>
       <div class="attempt-meter" id="attempt-meter" aria-hidden="true"></div>
@@ -59,11 +103,16 @@
   </section>
 
   <section id="result-panel" class="panel hidden">
-    <p class="eyebrow">03 · Diagnosis</p>
+    <p class="eyebrow">04 · Diagnosis</p>
     <div id="metrics" class="metrics"></div>
     <div id="charts" class="charts"></div>
     <p id="summary" class="summary"></p>
     <p id="verified-badge" class="verified-badge hidden">✓ numbers fact-checked against the script's output</p>
+    <p id="memory-note" class="memory-note hidden"></p>
+
+    <div class="result-actions">
+      <a id="report-link" class="report-btn" href="#" target="_blank" rel="noopener">Open report ↗</a>
+    </div>
 
     <details id="code-details">
       <summary>

@@ -8,6 +8,15 @@
   const questionEl = document.getElementById("question");
   const form = document.getElementById("analyze-form");
   const submitBtn = document.getElementById("submit-btn");
+  const raceCheckbox = document.getElementById("race-checkbox");
+
+  const suggestionsEl = document.getElementById("suggestions");
+
+  const cockpitPanel = document.getElementById("cockpit-panel");
+  const raceLanesEl = document.getElementById("race-lanes");
+  const streamNodeEl = document.getElementById("stream-node");
+  const streamTextEl = document.getElementById("stream-text");
+  const lessonsChip = document.getElementById("lessons-chip");
 
   const statusPanel = document.getElementById("status-panel");
   const statusPill = document.getElementById("status-pill");
@@ -15,18 +24,20 @@
   const attemptLabel = document.getElementById("attempt-label");
   const attemptsEl = document.getElementById("attempts");
 
-  const suggestionsEl = document.getElementById("suggestions");
   const resultPanel = document.getElementById("result-panel");
   const metricsEl = document.getElementById("metrics");
   const chartsEl = document.getElementById("charts");
   const summaryEl = document.getElementById("summary");
   const verifiedBadge = document.getElementById("verified-badge");
+  const memoryNote = document.getElementById("memory-note");
+  const reportLink = document.getElementById("report-link");
   const finalCodeEl = document.getElementById("final-code");
   const copyBtn = document.getElementById("copy-btn");
 
   let selectedFile = null;
   let renderedAttempts = 0;
   let pollHandle = null;
+  let eventSource = null;
 
   // ---------- drag & drop ----------
 
@@ -117,6 +128,7 @@
     const body = new FormData();
     body.append("file", selectedFile);
     body.append("question", question);
+    body.append("race", raceCheckbox.checked ? "2" : "1");
 
     try {
       const res = await fetch("/analyze", { method: "POST", body });
@@ -125,7 +137,9 @@
         throw new Error(err.detail || "request failed");
       }
       const { job_id } = await res.json();
+      cockpitPanel.classList.remove("hidden");
       statusPanel.classList.remove("hidden");
+      openEvents(job_id);
       startPolling(job_id);
     } catch (err) {
       setBusy(false);
@@ -145,9 +159,151 @@
     renderedAttempts = 0;
     attemptsEl.innerHTML = "";
     resultPanel.classList.add("hidden");
+    raceLanesEl.classList.add("hidden");
+    raceLanesEl.innerHTML = "";
+    lessonsChip.classList.add("hidden");
+    streamTextEl.textContent = "";
+    streamNodeEl.textContent = "waiting…";
+    document.querySelectorAll(".gnode").forEach((n) => n.classList.remove("active", "visited"));
+    document.querySelectorAll(".edge").forEach((n) => n.classList.remove("lit"));
+    if (eventSource) eventSource.close();
   }
 
-  // ---------- polling ----------
+  // ---------- live cockpit (SSE) ----------
+
+  const NODE_TO_SVG = {
+    profile_csv: "n-profile_csv",
+    plan: "n-plan",
+    write_code: "n-code",
+    race: "n-code",
+    execute: "n-execute",
+    review: "n-review",
+    critique: "n-critique",
+    summarize: "n-summarize",
+    verify: "n-verify",
+    learn: "n-learn",
+  };
+
+  const NODE_LABELS = {
+    plan: "planner · writing the analysis plan",
+    write_code: "coder · writing python",
+    race: "race · rival coders running",
+    critique: "debugger · diagnosing the failure",
+    summarize: "writer · drafting the insight",
+    profile_csv: "profiling the CSV",
+    execute: "sandbox · running the script",
+    review: "reviewer · judging quality",
+    verify: "fact-checker · verifying numbers",
+    learn: "librarian · distilling lessons",
+  };
+
+  const STREAMING_NODES = new Set(["plan", "write_code", "critique", "summarize"]);
+  const MAX_STREAM_CHARS = 8000;
+
+  function setActiveNode(node) {
+    document.querySelectorAll(".gnode.active").forEach((n) => n.classList.remove("active"));
+    const svgId = NODE_TO_SVG[node];
+    if (svgId) document.getElementById(svgId)?.classList.add("active");
+  }
+
+  function openEvents(jobId) {
+    eventSource = new EventSource(`/events/${jobId}`);
+    eventSource.onmessage = (msg) => {
+      let ev;
+      try {
+        ev = JSON.parse(msg.data);
+      } catch {
+        return;
+      }
+      handleEvent(ev);
+    };
+    eventSource.onerror = () => {
+      /* polling still drives the vitals panel; cockpit just freezes */
+    };
+  }
+
+  function handleEvent(ev) {
+    switch (ev.kind) {
+      case "node_start": {
+        setActiveNode(ev.node);
+        streamNodeEl.textContent = NODE_LABELS[ev.node] || ev.node;
+        if (STREAMING_NODES.has(ev.node)) streamTextEl.textContent = "";
+        break;
+      }
+      case "node_end": {
+        const svgId = NODE_TO_SVG[ev.node];
+        if (svgId) {
+          const el = document.getElementById(svgId);
+          el?.classList.remove("active");
+          el?.classList.add("visited");
+        }
+        break;
+      }
+      case "token": {
+        streamTextEl.textContent = (streamTextEl.textContent + ev.text).slice(-MAX_STREAM_CHARS);
+        streamTextEl.scrollTop = streamTextEl.scrollHeight;
+        break;
+      }
+      case "race_start": {
+        raceLanesEl.classList.remove("hidden");
+        raceLanesEl.innerHTML = "";
+        for (let i = 0; i < ev.n; i++) {
+          const lane = document.createElement("div");
+          lane.className = "race-lane";
+          lane.id = `lane-${i}`;
+          lane.innerHTML = `
+            <span class="lane-name">coder ${String.fromCharCode(65 + i)}</span>
+            <span class="lane-strategy">${escapeHtml(shortStrategy(ev.strategies[i]))}</span>
+            <span class="lane-phase" id="lane-phase-${i}">queued</span>`;
+          raceLanesEl.appendChild(lane);
+        }
+        break;
+      }
+      case "race_candidate": {
+        const phase = document.getElementById(`lane-phase-${ev.index}`);
+        if (phase) {
+          phase.textContent = { writing: "writing…", running: "running…", passed: "✓ passed", crashed: "✗ crashed" }[ev.phase] || ev.phase;
+          phase.className = `lane-phase phase-${ev.phase}`;
+        }
+        break;
+      }
+      case "race_end": {
+        if (ev.winner !== null && ev.winner !== undefined) {
+          document.getElementById(`lane-${ev.winner}`)?.classList.add("winner");
+          const note = document.createElement("p");
+          note.className = "race-reason";
+          note.textContent = ev.reason ? `judge: ${ev.reason}` : "winner chosen";
+          raceLanesEl.appendChild(note);
+        }
+        break;
+      }
+      case "lessons_applied": {
+        lessonsChip.classList.remove("hidden");
+        lessonsChip.textContent = `📚 ${ev.lessons.length} learned lesson${ev.lessons.length > 1 ? "s" : ""} applied`;
+        lessonsChip.title = ev.lessons.join("\n");
+        break;
+      }
+      case "lessons_learned": {
+        lessonsChip.classList.remove("hidden");
+        lessonsChip.textContent = `🧠 learned ${ev.count} new lesson${ev.count > 1 ? "s" : ""}`;
+        break;
+      }
+      case "job_done": {
+        eventSource?.close();
+        break;
+      }
+    }
+  }
+
+  function shortStrategy(s) {
+    if (!s) return "";
+    if (s.toLowerCase().includes("vectorized")) return "vectorized";
+    if (s.toLowerCase().includes("defensive")) return "defensive";
+    if (s.toLowerCase().includes("statistics")) return "stats-first";
+    return s.slice(0, 24);
+  }
+
+  // ---------- polling (vitals + result) ----------
 
   function startPolling(jobId) {
     if (pollHandle) clearInterval(pollHandle);
@@ -179,6 +335,13 @@
       clearInterval(pollHandle);
       setBusy(false);
       pulse.setMode("failed");
+      if (data.error && !data.history.length) {
+        const card = document.createElement("div");
+        card.className = "attempt-card";
+        card.innerHTML = `<h3>Run failed before any attempt</h3>
+          <div class="stderr-snippet">${escapeHtml(truncate(data.error, 500))}</div>`;
+        attemptsEl.appendChild(card);
+      }
     }
   }
 
@@ -261,6 +424,18 @@
 
     summaryEl.textContent = result.result_summary;
     verifiedBadge.classList.toggle("hidden", !result.verified);
+
+    const notes = [];
+    if ((result.lessons_used || []).length) {
+      notes.push(`📚 applied ${result.lessons_used.length} learned lesson${result.lessons_used.length > 1 ? "s" : ""}: ${result.lessons_used.join("; ")}`);
+    }
+    if (result.lessons_learned > 0) {
+      notes.push(`🧠 learned ${result.lessons_learned} new lesson${result.lessons_learned > 1 ? "s" : ""} for future runs`);
+    }
+    memoryNote.textContent = notes.join(" · ");
+    memoryNote.classList.toggle("hidden", notes.length === 0);
+
+    reportLink.href = result.report_url;
     finalCodeEl.textContent = result.code;
   }
 

@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import tempfile
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -13,13 +16,14 @@ import pandas as pd
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_groq import ChatGroq
 
-from app import prompts
-from app.sandbox import execute_code
+from app import memory, prompts
+from app.events import current_stream, emit
+from app.sandbox import ExecutionResult, execute_code
 
 if TYPE_CHECKING:
     from app.graph import AgentState
 
-MODEL_NAME = "llama-3.3-70b-versatile"
+MODEL_NAME = os.environ.get("DATAMEDIC_MODEL", "llama-3.3-70b-versatile")
 PROFILE_MAX_CHARS = 1500
 MAX_QUALITY_REVIEWS = 1  # how many "ran fine but analytically weak" redos are allowed
 EDA_QUESTION = "(auto-explore) What are the most interesting insights in this dataset?"
@@ -34,16 +38,45 @@ def _get_llm() -> ChatGroq:
             model=MODEL_NAME,
             temperature=0.2,
             api_key=os.environ.get("GROQ_API_KEY"),
+            max_retries=5,
         )
     return _llm
 
 
-def _ask(system_prompt: str, user_prompt: str) -> str:
+LLM_ATTEMPTS = 3
+LLM_BACKOFF_SECONDS = 15  # Groq free tier rate-limits by the minute; wait it out
+
+
+def _ask(system_prompt: str, user_prompt: str, node: str | None = None) -> str:
+    """One LLM call with rate-limit resilience. When `node` is given, tokens are
+    streamed to the job's event bus."""
     llm = _get_llm()
-    response = llm.invoke(
-        [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)]
-    )
-    return response.content.strip()
+    messages = [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)]
+
+    last_exc: Exception | None = None
+    for attempt in range(LLM_ATTEMPTS):
+        if attempt:
+            emit("llm_retry", node=node or "", attempt=attempt)
+            time.sleep(LLM_BACKOFF_SECONDS * attempt)
+        try:
+            if node is None:
+                return llm.invoke(messages).content.strip()
+
+            parts: list[str] = []
+            try:
+                for chunk in llm.stream(messages):
+                    piece = chunk.content or ""
+                    if piece:
+                        parts.append(piece)
+                        emit("token", node=node, text=piece)
+            except Exception:
+                if not parts:  # stream never started; fall back to a plain call
+                    return llm.invoke(messages).content.strip()
+            emit("token_end", node=node)
+            return "".join(parts).strip()
+        except Exception as exc:  # rate limit / transient network — back off and retry
+            last_exc = exc
+    raise last_exc  # type: ignore[misc]
 
 
 _CODE_FENCE_RE = re.compile(r"```(?:python)?\s*(.*?)```", re.DOTALL)
@@ -64,6 +97,17 @@ def _parse_json_reply(text: str) -> dict:
     if start == -1 or end <= start:
         raise ValueError(f"no JSON object in reply: {text[:200]!r}")
     return json.loads(text[start : end + 1])
+
+
+def _ask_json(system_prompt: str, user_prompt: str, tries: int = 2) -> dict:
+    """LLM call that must return JSON; re-asks once if the reply doesn't parse."""
+    last_exc: Exception | None = None
+    for _ in range(tries):
+        try:
+            return _parse_json_reply(_ask(system_prompt, user_prompt))
+        except (ValueError, json.JSONDecodeError) as exc:
+            last_exc = exc
+    raise last_exc  # type: ignore[misc]
 
 
 _METRICS_LINE_RE = re.compile(r"^METRICS_JSON:\s*(\{.*\})\s*$", re.MULTILINE)
@@ -108,12 +152,70 @@ def profile_csv_text(csv_path: str) -> str:
 def suggest_questions(csv_path: str) -> list[str]:
     """One-shot: propose 3 questions this CSV can answer. Used by the /suggest endpoint."""
     profile = profile_csv_text(csv_path)
-    reply = _ask(
+    payload = _ask_json(
         prompts.SUGGEST_SYSTEM_PROMPT,
         prompts.SUGGEST_USER_TEMPLATE.format(csv_profile=profile),
     )
-    questions = _parse_json_reply(reply).get("questions", [])
+    questions = payload.get("questions", [])
     return [q for q in questions if isinstance(q, str) and q.strip()][:3]
+
+
+# --- sandbox plumbing shared by execute and race ---
+
+
+def _run_sandboxed(code: str, csv_path: str) -> tuple[ExecutionResult, list[tuple[str, bytes]]]:
+    """Run code in a fresh sandbox dir (CSV provided as ./data.csv); charts as blobs."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tempdir = Path(tmpdir)
+        (tempdir / "data.csv").write_bytes(Path(csv_path).read_bytes())
+        result = execute_code(code, tempdir, tempdir / "chart_1.png")
+        chart_blobs = (
+            [(p.name, p.read_bytes()) for p in sorted(tempdir.glob("chart_*.png"))]
+            if result.success
+            else []
+        )
+    return result, chart_blobs
+
+
+def _apply_run(state: AgentState, result: ExecutionResult, chart_blobs: list) -> None:
+    """Fold an execution result into the state, persisting charts on success."""
+    state["stdout"] = result.stdout
+    state["stderr"] = result.stderr
+    if result.success:
+        state["metrics"] = extract_metrics(result.stdout)
+        job_dir = Path(state["csv_path"]).parent
+        charts: list[str] = []
+        for name, blob in chart_blobs:
+            dest = job_dir / name
+            dest.write_bytes(blob)
+            charts.append(str(dest))
+        state["charts"] = charts
+        state["chart_path"] = charts[0] if charts else None
+        # Not "done" yet — review, summarize, and verify still have to run.
+        state["status"] = "reviewing"
+    else:
+        state["charts"] = []
+        state["chart_path"] = None
+        state["status"] = "fixing"
+
+
+def _initial_code_prompts(state: AgentState) -> tuple[str, str]:
+    """System + user prompt for a first attempt, with any learned lessons injected."""
+    system_prompt = prompts.WRITE_CODE_SYSTEM_PROMPT.format(csv_path="data.csv")
+    user_prompt = prompts.WRITE_CODE_USER_TEMPLATE.format(
+        csv_profile=state["csv_profile"], question=state["question"], plan=state["plan"]
+    )
+    lessons = memory.retrieve_lessons(state["csv_profile"])
+    if lessons:
+        state["lessons_used"] = [l["symptom"] for l in lessons]
+        user_prompt += prompts.LESSONS_BLOCK_TEMPLATE.format(
+            lessons=memory.format_lessons(lessons)
+        )
+        emit("lessons_applied", lessons=state["lessons_used"])
+    return system_prompt, user_prompt
+
+
+# --- graph nodes ---
 
 
 def profile_csv(state: AgentState) -> AgentState:
@@ -134,12 +236,12 @@ def plan(state: AgentState) -> AgentState:
         user_prompt = prompts.PLAN_USER_TEMPLATE.format(
             csv_profile=state["csv_profile"], question=state["question"]
         )
-        state["plan"] = _ask(prompts.PLAN_SYSTEM_PROMPT, user_prompt)
+        state["plan"] = _ask(prompts.PLAN_SYSTEM_PROMPT, user_prompt, node="plan")
     else:
         state["mode"] = "eda"
         state["question"] = EDA_QUESTION
         user_prompt = prompts.PLAN_EDA_USER_TEMPLATE.format(csv_profile=state["csv_profile"])
-        state["plan"] = _ask(prompts.PLAN_EDA_SYSTEM_PROMPT, user_prompt)
+        state["plan"] = _ask(prompts.PLAN_EDA_SYSTEM_PROMPT, user_prompt, node="plan")
 
     state["status"] = "coding"
     return state
@@ -149,12 +251,9 @@ def write_code(state: AgentState) -> AgentState:
     """LLM: write (or rewrite, given prior failure/review) a standalone analysis script."""
     state["attempt"] = state.get("attempt", 0) + 1
 
-    # The runner copies the CSV into the sandbox cwd as data.csv (see execute), so the
-    # model never has to transcribe a long temp path — a reliable source of typo bugs.
-    system_prompt = prompts.WRITE_CODE_SYSTEM_PROMPT.format(csv_path="data.csv")
-
     history = state.get("history", [])
     if history:
+        system_prompt = prompts.WRITE_CODE_SYSTEM_PROMPT.format(csv_path="data.csv")
         last = history[-1]
         user_prompt = prompts.WRITE_CODE_RETRY_TEMPLATE.format(
             csv_profile=state["csv_profile"],
@@ -166,46 +265,87 @@ def write_code(state: AgentState) -> AgentState:
             critique=last["critique"],
         )
     else:
-        user_prompt = prompts.WRITE_CODE_USER_TEMPLATE.format(
-            csv_profile=state["csv_profile"], question=state["question"], plan=state["plan"]
-        )
+        system_prompt, user_prompt = _initial_code_prompts(state)
 
-    raw = _ask(system_prompt, user_prompt)
+    raw = _ask(system_prompt, user_prompt, node="write_code")
     state["code"] = _strip_code_fence(raw)
     state["status"] = "executing"
     return state
 
 
 def execute(state: AgentState) -> AgentState:
-    """Deterministic: run the generated code in a fresh temp dir and capture the result."""
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tempdir = Path(tmpdir)
-        # place the data where the generated code expects it: ./data.csv in the sandbox
-        (tempdir / "data.csv").write_bytes(Path(state["csv_path"]).read_bytes())
-        result = execute_code(state["code"], tempdir, tempdir / "chart_1.png")
+    """Deterministic: run the generated code in a fresh sandbox and fold in the result."""
+    result, chart_blobs = _run_sandboxed(state["code"], state["csv_path"])
+    _apply_run(state, result, chart_blobs)
+    return state
 
-        state["stdout"] = result.stdout
-        state["stderr"] = result.stderr
 
-        if result.success:
-            state["metrics"] = extract_metrics(result.stdout)
-            # Persist charts next to the job's own CSV, since the subprocess temp dir
-            # is deleted as soon as this block exits.
-            job_dir = Path(state["csv_path"]).parent
-            charts: list[str] = []
-            for src in sorted(tempdir.glob("chart_*.png")):
-                dest = job_dir / src.name
-                dest.write_bytes(src.read_bytes())
-                charts.append(str(dest))
-            state["charts"] = charts
-            state["chart_path"] = charts[0] if charts else None
-            # Not "done" yet — review, summarize, and verify still have to run.
-            state["status"] = "reviewing"
-        else:
-            state["charts"] = []
-            state["chart_path"] = None
-            state["status"] = "fixing"
+def race(state: AgentState) -> AgentState:
+    """Attempt 1, race mode: rival coders with different strategies run in parallel.
 
+    All candidates are generated and executed concurrently; a judge LLM picks the
+    best successful one. If everything crashes, the first candidate's failure is
+    handed to the normal critique path.
+    """
+    n = max(1, min(state.get("race_n", 1), len(prompts.RACE_STRATEGIES)))
+    state["attempt"] = 1
+    state["status"] = "executing"
+
+    system_prompt, base_user_prompt = _initial_code_prompts(state)
+    stream = current_stream()  # worker threads don't inherit the contextvar
+
+    def s_emit(kind: str, **data) -> None:
+        if stream is not None:
+            stream.emit(kind, **data)
+
+    s_emit("race_start", n=n, strategies=prompts.RACE_STRATEGIES[:n])
+
+    def run_candidate(i: int) -> dict:
+        s_emit("race_candidate", index=i, phase="writing")
+        user_prompt = f"{base_user_prompt}\n\nStyle directive: {prompts.RACE_STRATEGIES[i]}"
+        code = _strip_code_fence(_ask(system_prompt, user_prompt))
+        s_emit("race_candidate", index=i, phase="running")
+        result, blobs = _run_sandboxed(code, state["csv_path"])
+        s_emit("race_candidate", index=i, phase="passed" if result.success else "crashed")
+        return {"code": code, "result": result, "blobs": blobs}
+
+    with ThreadPoolExecutor(max_workers=n) as pool:
+        candidates = list(pool.map(run_candidate, range(n)))
+
+    winners = [i for i, c in enumerate(candidates) if c["result"].success]
+    reason = ""
+    if len(winners) > 1:
+        blocks = "\n\n".join(
+            f"Candidate {i} stdout:\n{candidates[i]['result'].stdout[:800]}" for i in winners
+        )
+        try:
+            verdict = _ask_json(
+                prompts.RACE_JUDGE_SYSTEM_PROMPT,
+                prompts.RACE_JUDGE_USER_TEMPLATE.format(
+                    question=state["question"], plan=state["plan"], candidates=blocks
+                ),
+            )
+            picked = int(verdict.get("winner", winners[0]))
+            reason = verdict.get("reason", "")
+            winner = picked if picked in winners else winners[0]
+        except (ValueError, TypeError, json.JSONDecodeError):
+            winner = winners[0]
+    elif winners:
+        winner = winners[0]
+    else:
+        winner = 0  # everything crashed; critique the first candidate
+
+    state["race_report"] = {
+        "strategies": prompts.RACE_STRATEGIES[:n],
+        "outcomes": ["passed" if c["result"].success else "crashed" for c in candidates],
+        "winner": winner if winners else None,
+        "reason": reason,
+    }
+    s_emit("race_end", **state["race_report"])
+
+    chosen = candidates[winner]
+    state["code"] = chosen["code"]
+    _apply_run(state, chosen["result"], chosen["blobs"])
     return state
 
 
@@ -222,7 +362,7 @@ def review(state: AgentState) -> AgentState:
         n_charts=len(state.get("charts", [])),
     )
     try:
-        verdict = _parse_json_reply(_ask(prompts.REVIEW_SYSTEM_PROMPT, user_prompt))
+        verdict = _ask_json(prompts.REVIEW_SYSTEM_PROMPT, user_prompt)
     except (ValueError, json.JSONDecodeError):
         verdict = {"verdict": "approve", "feedback": ""}  # unparseable review never blocks
 
@@ -253,7 +393,7 @@ def review(state: AgentState) -> AgentState:
 def critique(state: AgentState) -> AgentState:
     """LLM, only on failure: diagnose the bug and record the attempt in history."""
     user_prompt = prompts.CRITIQUE_USER_TEMPLATE.format(code=state["code"], stderr=state["stderr"])
-    critique_text = _ask(prompts.CRITIQUE_SYSTEM_PROMPT, user_prompt)
+    critique_text = _ask(prompts.CRITIQUE_SYSTEM_PROMPT, user_prompt, node="critique")
 
     history = state.get("history", [])
     history.append({"code": state["code"], "stderr": state["stderr"], "critique": critique_text})
@@ -268,7 +408,7 @@ def summarize(state: AgentState) -> AgentState:
     user_prompt = prompts.SUMMARIZE_USER_TEMPLATE.format(
         question=state["question"], plan=state["plan"], stdout=state["stdout"]
     )
-    state["result_summary"] = _ask(prompts.SUMMARIZE_SYSTEM_PROMPT, user_prompt)
+    state["result_summary"] = _ask(prompts.SUMMARIZE_SYSTEM_PROMPT, user_prompt, node="summarize")
     state["status"] = "verifying"
     return state
 
@@ -279,7 +419,7 @@ def verify(state: AgentState) -> AgentState:
         summary=state["result_summary"], stdout=state["stdout"]
     )
     try:
-        verdict = _parse_json_reply(_ask(prompts.VERIFY_SYSTEM_PROMPT, user_prompt))
+        verdict = _ask_json(prompts.VERIFY_SYSTEM_PROMPT, user_prompt)
         if not verdict.get("accurate", True) and verdict.get("corrected_summary"):
             state["result_summary"] = verdict["corrected_summary"]
         state["verified"] = True
@@ -287,4 +427,47 @@ def verify(state: AgentState) -> AgentState:
         state["verified"] = False  # verification failed to run; don't claim the badge
 
     state["status"] = "done"
+    return state
+
+
+def learn(state: AgentState) -> AgentState:
+    """LLM librarian: distill crashes into reusable lessons.
+
+    Runs after healed runs AND after exhausted ones — a run that kept crashing is
+    exactly the run worth learning from. Quality-review rejections aren't crashes
+    and don't generalize the same way, so only genuine failures are distilled.
+    Any error here is swallowed — learning must never break a finished run.
+    """
+    crashes = [
+        h for h in state.get("history", [])
+        if not h["stderr"].startswith("[quality review]")
+    ]
+    if not crashes:
+        return state
+
+    failures = "\n\n".join(
+        f"stderr:\n{h['stderr'][:600]}\ndiagnosis: {h['critique']}" for h in crashes
+    )
+    final_code = (
+        state["code"]
+        if state["status"] != "failed"
+        else "(no attempt ever succeeded — distill lessons from the failures alone)"
+    )
+    try:
+        payload = _ask_json(
+            prompts.DISTILL_SYSTEM_PROMPT,
+            prompts.DISTILL_USER_TEMPLATE.format(
+                csv_profile=state["csv_profile"],
+                failures=failures,
+                final_code=final_code,
+            ),
+        )
+        lessons = payload.get("lessons", [])
+        stored = memory.save_lessons(lessons)
+        state["lessons_learned"] = stored
+        if stored:
+            emit("lessons_learned", count=stored, lessons=[l.get("symptom", "") for l in lessons])
+    except Exception:
+        logging.exception("librarian failed to distill lessons")  # never fail the run
+
     return state

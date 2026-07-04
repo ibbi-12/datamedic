@@ -1,7 +1,10 @@
-"""FastAPI app: routes, background job execution, and static frontend serving."""
+"""FastAPI app: routes, background job execution, SSE, and static frontend serving."""
 
 from __future__ import annotations
 
+import asyncio
+import json
+import logging
 import tempfile
 import uuid
 from pathlib import Path
@@ -10,13 +13,15 @@ from typing import Any
 from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 load_dotenv()
 
+from app import events  # noqa: E402
 from app.graph import AgentState, build_graph  # noqa: E402
 from app.nodes import suggest_questions  # noqa: E402
+from app.report import build_report  # noqa: E402
 
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024  # 10 MB
 MAX_ATTEMPTS = 4
@@ -31,7 +36,7 @@ app = FastAPI(title="DataMedic")
 _graph = build_graph()
 
 
-def _initial_state(csv_path: str, question: str) -> AgentState:
+def _initial_state(csv_path: str, question: str, race_n: int = 1) -> AgentState:
     return {
         "csv_path": csv_path,
         "csv_profile": "",
@@ -43,9 +48,13 @@ def _initial_state(csv_path: str, question: str) -> AgentState:
         "stderr": "",
         "attempt": 0,
         "max_attempts": MAX_ATTEMPTS,
+        "race_n": race_n,
+        "race_report": {},
         "chart_path": None,
         "charts": [],
         "metrics": [],
+        "lessons_used": [],
+        "lessons_learned": 0,
         "reviews_used": 0,
         "verified": False,
         "result_summary": "",
@@ -54,15 +63,24 @@ def _initial_state(csv_path: str, question: str) -> AgentState:
     }
 
 
-def _run_job(job_id: str, csv_path: str, question: str) -> None:
+def _run_job(job_id: str, csv_path: str, question: str, race_n: int) -> None:
+    stream = events.STREAMS.get(job_id)
+    events.bind(stream)
     try:
-        for state in _graph.stream(_initial_state(csv_path, question), stream_mode="values"):
+        initial = _initial_state(csv_path, question, race_n)
+        for state in _graph.stream(initial, stream_mode="values"):
             JOBS[job_id] = state
     except Exception as exc:  # keep the job store consistent even on an unhandled error
-        job = JOBS.get(job_id, _initial_state(csv_path, question))
+        logging.exception("job %s failed with unhandled error", job_id)
+        job = JOBS.get(job_id, _initial_state(csv_path, question, race_n))
         job["status"] = "failed"
         job["stderr"] = f"{job.get('stderr', '')}\nunhandled error: {exc}".strip()
         JOBS[job_id] = job
+    finally:
+        events.bind(None)
+        if stream is not None:
+            stream.emit("job_done", status=JOBS.get(job_id, {}).get("status", "failed"))
+            stream.close()
 
 
 async def _read_csv_upload(file: UploadFile) -> bytes:
@@ -81,8 +99,10 @@ async def analyze(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     question: str = Form(""),
+    race: int = Form(1),
 ) -> dict[str, str]:
     contents = await _read_csv_upload(file)
+    race_n = max(1, min(race, 3))
 
     job_id = uuid.uuid4().hex
     job_dir = JOBS_DIR / job_id
@@ -90,8 +110,9 @@ async def analyze(
     csv_path = job_dir / "data.csv"
     csv_path.write_bytes(contents)
 
-    JOBS[job_id] = _initial_state(str(csv_path), question)
-    background_tasks.add_task(_run_job, job_id, str(csv_path), question)
+    JOBS[job_id] = _initial_state(str(csv_path), question, race_n)
+    events.create_stream(job_id)
+    background_tasks.add_task(_run_job, job_id, str(csv_path), question, race_n)
 
     return {"job_id": job_id}
 
@@ -110,6 +131,33 @@ async def suggest(file: UploadFile = File(...)) -> dict[str, list[str]]:
     return {"questions": questions}
 
 
+@app.get("/events/{job_id}")
+async def job_events(job_id: str) -> StreamingResponse:
+    """Server-Sent Events: replay this job's event log, then follow it live."""
+    if job_id not in events.STREAMS and job_id not in JOBS:
+        raise HTTPException(status_code=404, detail="job not found")
+
+    async def gen():
+        sent = 0
+        while True:
+            stream = events.STREAMS.get(job_id)
+            if stream is None:
+                break
+            pending = stream.events[sent:]
+            for event in pending:
+                yield f"data: {json.dumps(event)}\n\n"
+            sent += len(pending)
+            if stream.closed and sent >= len(stream.events):
+                break
+            await asyncio.sleep(0.12)
+
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 @app.get("/status/{job_id}")
 async def status(job_id: str) -> dict[str, Any]:
     job = JOBS.get(job_id)
@@ -120,6 +168,7 @@ async def status(job_id: str) -> dict[str, Any]:
         "attempt": job["attempt"],
         "max_attempts": job["max_attempts"],
         "history": job["history"],
+        "error": job.get("stderr", "") if job["status"] == "failed" else "",
     }
 
 
@@ -135,12 +184,29 @@ async def result(job_id: str) -> dict[str, Any]:
         "result_summary": job["result_summary"],
         "metrics": job.get("metrics", []),
         "verified": job.get("verified", False),
+        "lessons_used": job.get("lessons_used", []),
+        "lessons_learned": job.get("lessons_learned", 0),
+        "race_report": job.get("race_report", {}),
         "code": job["code"],
         "history": job["history"],
         "chart_urls": [
             f"/chart/{job_id}/{i}" for i in range(len(job.get("charts", [])))
         ],
+        "report_url": f"/report/{job_id}",
     }
+
+
+@app.get("/report/{job_id}")
+async def report(job_id: str) -> HTMLResponse:
+    """A finished job as one self-contained HTML file (charts inlined)."""
+    job = JOBS.get(job_id)
+    if job is None or job.get("status") != "done":
+        raise HTTPException(status_code=404, detail="finished job not found")
+    html_doc = build_report(job)
+    return HTMLResponse(
+        html_doc,
+        headers={"Content-Disposition": f'inline; filename="datamedic-report-{job_id[:8]}.html"'},
+    )
 
 
 @app.get("/chart/{job_id}/{index}")

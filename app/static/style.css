@@ -336,6 +336,228 @@ button {
   }
 }
 
+.race-toggle {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  margin-top: 1rem;
+  font-size: 0.83rem;
+  color: var(--muted);
+  cursor: pointer;
+  user-select: none;
+}
+
+.race-toggle input {
+  accent-color: var(--accent);
+}
+
+/* --- agent cockpit --- */
+
+#agent-graph {
+  width: 100%;
+  height: auto;
+  display: block;
+  margin-bottom: 0.9rem;
+}
+
+#agent-graph .edge {
+  fill: none;
+  stroke: var(--border);
+  stroke-width: 1.6;
+}
+
+#agent-graph .edge-fail {
+  stroke-dasharray: 4 3;
+  stroke: var(--danger-dim);
+  opacity: 0.55;
+}
+
+#agent-graph .gnode rect {
+  fill: var(--panel-raised);
+  stroke: var(--border);
+  stroke-width: 1.2;
+  transition: fill 0.2s ease, stroke 0.2s ease;
+}
+
+#agent-graph .gnode text {
+  fill: var(--muted);
+  font-family: var(--mono);
+  font-size: 12px;
+  text-anchor: middle;
+  transition: fill 0.2s ease;
+}
+
+#agent-graph .gnode.visited rect {
+  stroke: var(--accent-dim);
+}
+
+#agent-graph .gnode.visited text {
+  fill: var(--ink);
+}
+
+#agent-graph .gnode.active rect {
+  fill: rgba(232, 162, 61, 0.14);
+  stroke: var(--accent);
+  animation: node-pulse 1.2s ease-in-out infinite;
+}
+
+#agent-graph .gnode.active text {
+  fill: var(--accent);
+}
+
+#agent-graph .gnode-fail rect {
+  stroke: var(--danger-dim);
+}
+
+#agent-graph .gnode-fail.active rect {
+  fill: rgba(232, 96, 74, 0.12);
+  stroke: var(--danger);
+}
+
+#agent-graph .gnode-fail.active text,
+#agent-graph .gnode-fail.visited text {
+  fill: var(--danger);
+}
+
+@keyframes node-pulse {
+  0%, 100% { stroke-width: 1.2; }
+  50% { stroke-width: 2.4; }
+}
+
+.graph-caption {
+  fill: var(--muted-dim);
+  font-family: var(--mono);
+  font-size: 10px;
+}
+
+.stream-box {
+  background: #100d09;
+  border: 1px solid var(--border-soft);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.stream-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.6rem;
+  padding: 0.45rem 0.8rem;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.stream-node {
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+
+.lessons-chip {
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  color: var(--success);
+  white-space: nowrap;
+}
+
+.lessons-chip.hidden {
+  display: none;
+}
+
+.stream-text {
+  margin: 0;
+  padding: 0.7rem 0.85rem;
+  height: 132px;
+  overflow-y: auto;
+  font-family: var(--mono);
+  font-size: 0.74rem;
+  line-height: 1.5;
+  color: var(--ink);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.race-lanes {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+  margin-bottom: 0.9rem;
+}
+
+.race-lanes.hidden {
+  display: none;
+}
+
+.race-lane {
+  flex: 1 1 200px;
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  background: var(--panel-raised);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.5rem 0.75rem;
+  transition: border-color 0.2s ease;
+}
+
+.race-lane.winner {
+  border-color: var(--success-dim);
+  background: rgba(76, 187, 130, 0.06);
+}
+
+.race-lane.winner::after {
+  content: "🏁";
+  margin-left: auto;
+}
+
+.lane-name {
+  font-family: var(--display);
+  font-weight: 700;
+  font-size: 0.82rem;
+  color: var(--ink);
+  white-space: nowrap;
+}
+
+.lane-strategy {
+  font-family: var(--mono);
+  font-size: 0.7rem;
+  color: var(--muted-dim);
+}
+
+.lane-phase {
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  color: var(--muted);
+  margin-left: auto;
+  white-space: nowrap;
+}
+
+.race-lane.winner .lane-phase {
+  margin-left: 0;
+}
+
+.lane-phase.phase-passed {
+  color: var(--success);
+}
+
+.lane-phase.phase-crashed {
+  color: var(--danger);
+}
+
+.lane-phase.phase-writing,
+.lane-phase.phase-running {
+  color: var(--accent);
+}
+
+.race-reason {
+  flex-basis: 100%;
+  margin: 0;
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  color: var(--muted);
+}
+
 /* --- status / vitals --- */
 
 .status-row {
@@ -589,11 +811,44 @@ button {
   font-family: var(--mono);
   font-size: 0.75rem;
   color: var(--success);
-  margin: 0.2rem 0 0.9rem;
+  margin: 0.2rem 0 0.4rem;
 }
 
 .verified-badge.hidden {
   display: none;
+}
+
+.memory-note {
+  font-family: var(--mono);
+  font-size: 0.75rem;
+  color: var(--accent-dim);
+  margin: 0 0 0.6rem;
+}
+
+.memory-note.hidden {
+  display: none;
+}
+
+.result-actions {
+  margin: 0.4rem 0 1rem;
+}
+
+.report-btn {
+  display: inline-block;
+  background: var(--panel-raised);
+  color: var(--ink);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.4rem 0.9rem;
+  font-family: var(--mono);
+  font-size: 0.78rem;
+  text-decoration: none;
+  transition: border-color 0.15s ease, color 0.15s ease;
+}
+
+.report-btn:hover {
+  border-color: var(--accent-dim);
+  color: var(--accent);
 }
 
 .attempt-card.review-card {

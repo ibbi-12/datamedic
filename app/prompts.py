@@ -221,3 +221,69 @@ SUGGEST_USER_TEMPLATE = """CSV profile:
 {csv_profile}
 
 Propose the 3 questions now."""
+
+
+LESSONS_BLOCK_TEMPLATE = """
+Lessons learned from previous analyses of similar data (apply them proactively):
+{lessons}
+"""
+
+
+DISTILL_SYSTEM_PROMPT = """You are the librarian of a data-analysis agent. A run just \
+finished: it crashed at least once, was diagnosed, and finally succeeded. Distill each \
+failure into a GENERAL lesson that would prevent the same class of bug on FUTURE datasets \
+— not just this one.
+
+Rules for each lesson:
+- "symptom": one short sentence naming the data condition that caused the bug (general, \
+no column names from this specific file).
+- "lesson": one imperative sentence telling a future coder what to do about it.
+- "triggers": 2-4 short lowercase fragments COPIED FROM THE CSV PROFILE ABOVE that signal \
+this condition (a dtype word like "object"/"str", a sample-value fragment like "$" or "," or \
+"n/a", a column-name word). They are matched as substrings against future CSV profiles, so \
+only use text that would literally appear in a profile — never abstract words like \
+"decimal" or "conversion".
+- Skip failures that were one-off typos or too specific to generalize.
+
+Respond with ONLY a compact JSON object, no prose, no code fences:
+{"lessons": [{"symptom": "...", "lesson": "...", "triggers": ["...", "..."]}]}
+Return {"lessons": []} if nothing generalizes.
+"""
+
+DISTILL_USER_TEMPLATE = """CSV profile of the data that caused the failures:
+{csv_profile}
+
+Failures (traceback + diagnosis), in order:
+{failures}
+
+The final working code:
+```python
+{final_code}
+```
+
+Distill the lessons now."""
+
+
+RACE_JUDGE_SYSTEM_PROMPT = """You are judging rival analysis scripts that ALL ran \
+successfully on the same data for the same question. Pick the one whose stdout best \
+answers the question: concrete numbers over table dumps, directly on-topic, clearly \
+presented.
+
+Respond with ONLY a compact JSON object, no prose, no code fences:
+{"winner": <0-based index of the best candidate>, "reason": "<one sentence>"}
+"""
+
+RACE_JUDGE_USER_TEMPLATE = """Question: {question}
+
+Analysis plan:
+{plan}
+
+{candidates}
+
+Pick the winner now."""
+
+RACE_STRATEGIES = [
+    "Favor a concise, vectorized pandas approach — lean directly on groupby/agg chains.",
+    "Favor a defensive, step-by-step approach — clean each column explicitly before use.",
+    "Favor a statistics-first approach — lead with correlations, rates of change, and shares of total.",
+]
