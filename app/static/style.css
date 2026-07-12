@@ -542,7 +542,7 @@ button {
 }
 
 .lane-phase.phase-crashed {
-  color: var(--danger);
+  color: var(--accent);
 }
 
 .lane-phase.phase-writing,
@@ -656,11 +656,33 @@ button {
 
 .attempt-card {
   border: 1px solid var(--border-soft);
-  border-left: 3px solid var(--danger-dim);
+  border-left: 3px solid var(--accent-dim);
   border-radius: 6px;
   padding: 0.9rem 1rem;
   margin-bottom: 0.75rem;
   animation: card-in 0.3s ease both;
+}
+
+/* A crash is a self-correction step, not a failure — frame it in amber. */
+.attempt-card.correcting-card {
+  border-left-color: var(--accent-dim);
+}
+
+.attempt-card.correcting-card h3 {
+  color: var(--accent);
+}
+
+/* One calm line naming the error, instead of a wall of red traceback. */
+.error-oneline {
+  color: var(--danger-dim);
+  font-family: var(--mono);
+  font-size: 0.78rem;
+  line-height: 1.45;
+  margin: 0 0 0.15rem;
+}
+
+.attempt-card pre.trace code {
+  color: var(--danger-dim);
 }
 
 @keyframes card-in {

@@ -270,7 +270,7 @@
       case "race_candidate": {
         const phase = document.getElementById(`lane-phase-${ev.index}`);
         if (phase) {
-          phase.textContent = { writing: "writing…", running: "running…", passed: "✓ passed", crashed: "✗ crashed" }[ev.phase] || ev.phase;
+          phase.textContent = { writing: "writing…", running: "running…", passed: "✓ passed", crashed: "✗ error" }[ev.phase] || ev.phase;
           phase.className = `lane-phase phase-${ev.phase}`;
         }
         break;
@@ -360,7 +360,7 @@
     reviewing: "Reviewing quality",
     summarizing: "Writing summary",
     verifying: "Fact-checking",
-    fixing: "Fixing",
+    fixing: "Correcting error",
     done: "Done",
     failed: "Failed",
   };
@@ -389,19 +389,41 @@
       const h = history[i];
       const isReview = (h.stderr || "").startsWith("[quality review]");
       const card = document.createElement("div");
-      card.className = "attempt-card" + (isReview ? " review-card" : "");
+      card.className = "attempt-card " + (isReview ? "review-card" : "correcting-card");
+      // Frame a crash as self-correction, not failure: a one-line error + the
+      // agent's own diagnosis up front, the full traceback tucked behind a toggle.
+      const heading = isReview
+        ? `Attempt ${i + 1} sent back by reviewer`
+        : `⟳ Correcting error · attempt ${i + 1}`;
+      const errLine = isReview ? "" : oneLineError(h.stderr);
+      const trace = isReview
+        ? ""
+        : `<pre class="trace"><code>${escapeHtml(truncate(h.stderr, 1200))}</code></pre>`;
       card.innerHTML = `
-        <h3>${isReview ? `Attempt ${i + 1} sent back by reviewer` : `Attempt ${i + 1} failed`}</h3>
+        <h3>${heading}</h3>
+        ${errLine ? `<div class="error-oneline">${escapeHtml(errLine)}</div>` : ""}
+        <p class="critique-line">${escapeHtml(h.critique)}</p>
         <details>
-          <summary>Show code</summary>
+          <summary>${isReview ? "Show code" : "Show error trace & code"}</summary>
+          ${trace}
           <pre><code>${escapeHtml(h.code)}</code></pre>
         </details>
-        <div class="stderr-snippet">${escapeHtml(truncate(h.stderr, 400))}</div>
-        <p class="critique-line">${escapeHtml(h.critique)}</p>
       `;
       attemptsEl.appendChild(card);
     }
     renderedAttempts = history.length;
+  }
+
+  // Pull the single most informative line out of a traceback (the exception line),
+  // so a crash reads as one calm line instead of a wall of red.
+  function oneLineError(stderr) {
+    if (!stderr) return "";
+    const lines = stderr.trim().split("\n").map((s) => s.trim()).filter(Boolean);
+    if (!lines.length) return "";
+    const exc = [...lines].reverse().find((l) =>
+      /(^|\.)[A-Za-z_]*(Error|Exception|Warning)\b|blocked import|TIMEOUT/i.test(l)
+    );
+    return exc || lines[lines.length - 1];
   }
 
   function renderResult(result) {
