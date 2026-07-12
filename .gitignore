@@ -6,3 +6,5 @@ __pycache__/
 examples/chart.png
 .claude/
 lessons.json
+.DS_Store
+docs/datamedic-demo.mp4
