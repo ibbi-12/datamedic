@@ -20,7 +20,7 @@ load_dotenv()
 
 from app import events  # noqa: E402
 from app.graph import AgentState, build_graph  # noqa: E402
-from app.nodes import suggest_questions  # noqa: E402
+from app.nodes import CSVLoadError, suggest_questions  # noqa: E402
 from app.report import build_report  # noqa: E402
 
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024  # 10 MB
@@ -74,7 +74,8 @@ def _run_job(job_id: str, csv_path: str, question: str, race_n: int) -> None:
         logging.exception("job %s failed with unhandled error", job_id)
         job = JOBS.get(job_id, _initial_state(csv_path, question, race_n))
         job["status"] = "failed"
-        job["stderr"] = f"{job.get('stderr', '')}\nunhandled error: {exc}".strip()
+        prefix = "could not read this CSV" if isinstance(exc, CSVLoadError) else "unhandled error"
+        job["stderr"] = f"{job.get('stderr', '')}\n{prefix}: {exc}".strip()
         JOBS[job_id] = job
     finally:
         events.bind(None)

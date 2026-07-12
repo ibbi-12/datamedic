@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 import json
 import logging
 import os
@@ -28,6 +29,65 @@ MODEL_NAME = os.environ.get("DATAMEDIC_MODEL", "llama-3.3-70b-versatile")
 PROFILE_MAX_CHARS = 1500
 MAX_QUALITY_REVIEWS = 1  # how many "ran fine but analytically weak" redos are allowed
 EDA_QUESTION = "(auto-explore) What are the most interesting insights in this dataset?"
+
+# Tried in order until one decodes the file. Covers the overwhelming majority of
+# real-world exports: Excel/Windows CSVs are frequently cp1252, not UTF-8.
+_ENCODING_FALLBACKS = ("utf-8-sig", "utf-8", "cp1252", "latin-1")
+
+
+class CSVLoadError(ValueError):
+    """The uploaded file couldn't be parsed into a usable table under any fallback."""
+
+
+def _read_csv_with_encoding(csv_path: str, encoding: str, sep: str = ",") -> pd.DataFrame:
+    try:
+        return pd.read_csv(csv_path, encoding=encoding, sep=sep)
+    except pd.errors.ParserError:
+        # Ragged rows (inconsistent column counts) — skip the offending lines
+        # instead of aborting the whole load.
+        return pd.read_csv(csv_path, encoding=encoding, sep=sep, engine="python", on_bad_lines="skip")
+
+
+def load_csv_robust(csv_path: str) -> pd.DataFrame:
+    """Load an unseen CSV defensively.
+
+    An unknown encoding, delimiter, or a few ragged rows must not crash the job
+    before the agent ever gets a chance to run — profile_csv sits outside the
+    self-healing retry loop, so a raw pandas exception here would be terminal.
+    """
+    df: pd.DataFrame | None = None
+    used_encoding = "utf-8"
+    last_exc: Exception | None = None
+    for encoding in _ENCODING_FALLBACKS:
+        try:
+            df = _read_csv_with_encoding(csv_path, encoding)
+            used_encoding = encoding
+            break
+        except UnicodeDecodeError as exc:
+            last_exc = exc
+        except pd.errors.EmptyDataError as exc:
+            raise CSVLoadError("the file is empty or has no columns to parse") from exc
+    if df is None:
+        raise CSVLoadError(
+            f"could not decode the file as text (tried {', '.join(_ENCODING_FALLBACKS)})"
+        ) from last_exc
+
+    # A single resulting column often means the wrong delimiter was assumed (e.g. a
+    # semicolon- or tab-separated file). Re-sniff among common delimiters only —
+    # csv.Sniffer is unreliable/wrong when the data is genuinely single-column.
+    if df.shape[1] == 1:
+        try:
+            with open(csv_path, encoding=used_encoding, errors="replace") as fh:
+                sample = fh.read(4096)
+            dialect = csv.Sniffer().sniff(sample, delimiters=",;\t|")
+            if dialect.delimiter != ",":
+                df = _read_csv_with_encoding(csv_path, used_encoding, sep=dialect.delimiter)
+        except csv.Error:
+            pass  # genuinely one column; keep as-is
+
+    if df.shape[1] == 0:
+        raise CSVLoadError("no columns found in the file")
+    return df
 
 _llm: ChatGroq | None = None
 
@@ -150,8 +210,11 @@ def extract_metrics(stdout: str) -> list[dict]:
 
 
 def profile_csv_text(csv_path: str) -> str:
-    """Load a CSV and produce the profile string used in every prompt."""
-    df = pd.read_csv(csv_path)
+    """Load a CSV robustly and produce the profile string used in every prompt."""
+    return _dataframe_profile(load_csv_robust(csv_path))
+
+
+def _dataframe_profile(df: pd.DataFrame) -> str:
     lines = [
         f"shape: {df.shape[0]} rows x {df.shape[1]} columns",
         "",
@@ -240,8 +303,16 @@ def _initial_code_prompts(state: AgentState) -> tuple[str, str]:
 
 
 def profile_csv(state: AgentState) -> AgentState:
-    """Deterministic: load the CSV and summarize its shape/dtypes/nulls/sample rows."""
-    state["csv_profile"] = profile_csv_text(state["csv_path"])
+    """Deterministic: load the CSV and summarize its shape/dtypes/nulls/sample rows.
+
+    Also normalizes the on-disk file to clean comma-separated UTF-8. Unseen CSVs may
+    arrive with a different delimiter, a non-UTF-8 encoding, or ragged rows; the
+    generated code always does a plain pd.read_csv(), so without this it would face a
+    different (and unexplained) parse than what the profile below describes.
+    """
+    df = load_csv_robust(state["csv_path"])
+    Path(state["csv_path"]).write_text(df.to_csv(index=False))
+    state["csv_profile"] = _dataframe_profile(df)
     state["status"] = "planning"
     return state
 
